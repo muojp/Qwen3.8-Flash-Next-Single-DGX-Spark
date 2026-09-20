@@ -32,5 +32,16 @@ class PlainLaunchTests(unittest.TestCase):
         result = subprocess.check_output(['bash', '-c', script], env={'PATH': os.defpath}).decode()
         self.assertNotIn('WATCHDOG', result)
 
+class FirstBootTests(unittest.TestCase):
+    def test_empty_log_archive_does_not_abort_first_boot(self):
+        source = (ROOT / 'start.sh').read_text()
+        block = source.split('ls -1t "$SCRIPT_DIR"/logs/archive/', 1)[1].split('if docker inspect', 1)[0]
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / 'logs/archive').mkdir(parents=True)
+            result = subprocess.run(['bash', '-c', 'set -euo pipefail\nls -1t "$SCRIPT_DIR"/logs/archive/' + block + '\necho REACHED_LAUNCH'],
+                                    env={'PATH': os.defpath, 'SCRIPT_DIR': td}, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('REACHED_LAUNCH', result.stdout)
+
 if __name__ == '__main__':
     unittest.main()

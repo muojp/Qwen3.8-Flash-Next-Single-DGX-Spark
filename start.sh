@@ -715,13 +715,14 @@ print(" ".join(sorted(algos)))
 PY
 )
     if [[ -n "$_QALGO" ]]; then
-        _DISPATCH=$(docker run --rm -e VLLM_NO_USAGE_STATS=1 -e DO_NOT_TRACK=1 -e HF_HUB_DISABLE_TELEMETRY=1 -e WANDB_DISABLED=true --network none --entrypoint python3 \
-            -v "$MODEL_PATH/$SNAPSHOT_REL:/m:ro" "$IMAGE" -c '
-import json, pathlib, sys
-cfg = json.loads(pathlib.Path("/m/config.json").read_text())
+        _DISPATCH=$(docker run --rm -e VLLM_NO_USAGE_STATS=1 -e DO_NOT_TRACK=1 -e HF_HUB_DISABLE_TELEMETRY=1 -e WANDB_DISABLED=true -e VLLM_LOGGING_LEVEL=ERROR --network none --entrypoint python3 \
+            -v "$HF_CACHE_DIR:/hf:ro" -e "MODEL_SNAPSHOT=/hf/hub/models--${ORG}--${NAME}/$SNAPSHOT_REL" "$IMAGE" -c '
+import json, os, pathlib, sys
+snapshot = pathlib.Path(os.environ["MODEL_SNAPSHOT"])
+cfg = json.loads((snapshot / "config.json").read_text())
 qc = cfg.get("quantization_config")
-if not qc and pathlib.Path("/m/hf_quant_config.json").is_file():
-    qc = json.loads(pathlib.Path("/m/hf_quant_config.json").read_text())
+if not qc and (snapshot / "hf_quant_config.json").is_file():
+    qc = json.loads((snapshot / "hf_quant_config.json").read_text())
 if not qc:
     print(json.dumps({"declared": []})); sys.exit(0)
 algos = qc.get("quant_algo") or []
@@ -800,7 +801,7 @@ PLE_CACHE_CTR="/root/.cache/vllm/ple_cache/${PLE_ORG}--${PLE_NAME}"
 if ! ls "$PLE_CACHE_HOST"/*.packed_u8 >/dev/null 2>&1; then
     info "Building packed PLE table (one-time, ~40 s, <1 GiB RAM, no GPU)..."
     mkdir -p "$PLE_CACHE_HOST"
-    docker run --rm -e VLLM_NO_USAGE_STATS=1 -e DO_NOT_TRACK=1 -e HF_HUB_DISABLE_TELEMETRY=1 -e WANDB_DISABLED=true --network none --name "${CONTAINER_NAME}-plebuild" --memory 6g --cpus 8 \
+    docker run --rm -e VLLM_NO_USAGE_STATS=1 -e DO_NOT_TRACK=1 -e HF_HUB_DISABLE_TELEMETRY=1 -e WANDB_DISABLED=true -e VLLM_LOGGING_LEVEL=ERROR --network none --name "${CONTAINER_NAME}-plebuild" --memory 6g --cpus 8 \
         -v "$MODEL_PATH:/m:ro" -v "$HOME/.cache/vllm/ple_cache:/out" \
         -v "$SCRIPT_DIR/files/build_ple_packed_table.py:/b.py:ro" \
         --entrypoint python3 "$IMAGE" -u /b.py "/m/$SNAPSHOT_REL" "/out/${PLE_ORG}--${PLE_NAME}"
@@ -871,10 +872,10 @@ if [[ "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 ]]; then
     fi
     if [[ -z "$_MTP_BLOCK" ]]; then
         # Best-effort; any failure falls through to the known-good table.
-        _MTP_INTRO=$(docker run --rm -e VLLM_NO_USAGE_STATS=1 -e DO_NOT_TRACK=1 -e HF_HUB_DISABLE_TELEMETRY=1 -e WANDB_DISABLED=true --network none -v "$MODEL_PATH/$SNAPSHOT_REL:/m:ro" \
+        _MTP_INTRO=$(docker run --rm -e VLLM_NO_USAGE_STATS=1 -e DO_NOT_TRACK=1 -e HF_HUB_DISABLE_TELEMETRY=1 -e WANDB_DISABLED=true -e VLLM_LOGGING_LEVEL=ERROR --network none -v "$HF_CACHE_DIR:/hf:ro" -e "MODEL_SNAPSHOT=/hf/hub/models--${ORG}--${NAME}/$SNAPSHOT_REL" \
             --entrypoint python3 "$IMAGE" -c '
-import json, importlib, math, pathlib, sys
-cfg = json.loads(pathlib.Path("/m/config.json").read_text())
+import json, importlib, math, os, pathlib, sys
+cfg = json.loads((pathlib.Path(os.environ["MODEL_SNAPSHOT"]) / "config.json").read_text())
 tc = cfg.get("text_config", cfg)
 cr = int(tc.get("qsa_compress_ratio", tc.get("compress_ratio", 4)))
 bs = None
@@ -1102,7 +1103,7 @@ ARCHIVE_TS=$(date '+%Y%m%dT%H%M%S')
 ls -1t "$SCRIPT_DIR"/logs/archive/*-container.log 2>/dev/null | tail -n +21 | while read -r f; do
     _set="${f%-container.log}"
     rm -f "${_set}-container.log" "${_set}-memwatch.log" "${_set}-probe-latency.log" "${_set}-timeout.log" 2>/dev/null || true
-done
+done || true
 if docker inspect "$CONTAINER_NAME" &>/dev/null; then
     # The old container is removed below; keep its log for the post-mortem first.
     docker logs --tail 3000 "$CONTAINER_NAME" > "$SCRIPT_DIR/logs/archive/${CONTAINER_NAME}-${ARCHIVE_TS}-container.log" 2>&1 || true
