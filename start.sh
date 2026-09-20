@@ -118,7 +118,7 @@ _ENV_SNAPSHOT_VARS=(KV_TARGET_GIB HOST_RESERVE_GIB HOST_SLACK_GIB OS_RESERVE_GIB
                     EXTRA_VLLM_ARGS EXTRA_DOCKER_ARGS NATIVE_MAX_MODEL_LEN
                     YARN_CEILING_MODEL_LEN BIND READY_TIMEOUT_S API_KEY
                     VLLM_QSA_DET_TOPK VLLM_MOE_DET_FINALIZE GDN_DECODE_KERNEL
-                    MTP_DISABLE_BLOCK_DROP CHAT_TEMPLATE)
+                    MTP_DISABLE_BLOCK_DROP CHAT_TEMPLATE MEMWATCH_ENABLED)
 for _v in "${_ENV_SNAPSHOT_VARS[@]}"; do
     eval "_SNAP_$_v=\${$_v-}"
     eval "_SNAPSET_$_v=\${$_v+set}"
@@ -715,7 +715,7 @@ print(" ".join(sorted(algos)))
 PY
 )
     if [[ -n "$_QALGO" ]]; then
-        _DISPATCH=$(docker run --rm --entrypoint python3 \
+        _DISPATCH=$(docker run --rm -e VLLM_NO_USAGE_STATS=1 -e DO_NOT_TRACK=1 -e HF_HUB_DISABLE_TELEMETRY=1 -e WANDB_DISABLED=true --network none --entrypoint python3 \
             -v "$MODEL_PATH/$SNAPSHOT_REL:/m:ro" "$IMAGE" -c '
 import json, pathlib, sys
 cfg = json.loads(pathlib.Path("/m/config.json").read_text())
@@ -800,7 +800,7 @@ PLE_CACHE_CTR="/root/.cache/vllm/ple_cache/${PLE_ORG}--${PLE_NAME}"
 if ! ls "$PLE_CACHE_HOST"/*.packed_u8 >/dev/null 2>&1; then
     info "Building packed PLE table (one-time, ~40 s, <1 GiB RAM, no GPU)..."
     mkdir -p "$PLE_CACHE_HOST"
-    docker run --rm --name "${CONTAINER_NAME}-plebuild" --memory 6g --cpus 8 \
+    docker run --rm -e VLLM_NO_USAGE_STATS=1 -e DO_NOT_TRACK=1 -e HF_HUB_DISABLE_TELEMETRY=1 -e WANDB_DISABLED=true --network none --name "${CONTAINER_NAME}-plebuild" --memory 6g --cpus 8 \
         -v "$MODEL_PATH:/m:ro" -v "$HOME/.cache/vllm/ple_cache:/out" \
         -v "$SCRIPT_DIR/files/build_ple_packed_table.py:/b.py:ro" \
         --entrypoint python3 "$IMAGE" -u /b.py "/m/$SNAPSHOT_REL" "/out/${PLE_ORG}--${PLE_NAME}"
@@ -871,7 +871,7 @@ if [[ "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 ]]; then
     fi
     if [[ -z "$_MTP_BLOCK" ]]; then
         # Best-effort; any failure falls through to the known-good table.
-        _MTP_INTRO=$(docker run --rm -v "$MODEL_PATH/$SNAPSHOT_REL:/m:ro" \
+        _MTP_INTRO=$(docker run --rm -e VLLM_NO_USAGE_STATS=1 -e DO_NOT_TRACK=1 -e HF_HUB_DISABLE_TELEMETRY=1 -e WANDB_DISABLED=true --network none -v "$MODEL_PATH/$SNAPSHOT_REL:/m:ro" \
             --entrypoint python3 "$IMAGE" -c '
 import json, importlib, math, pathlib, sys
 cfg = json.loads(pathlib.Path("/m/config.json").read_text())
@@ -1027,11 +1027,15 @@ LAUNCH_SCRIPT=$(mktemp /tmp/vllm_tp1_XXXXXX.sh)
 cat > "$LAUNCH_SCRIPT" <<LAUNCH_EOF
 #!/bin/bash
 docker run \\
-    -d --name $CONTAINER_NAME \\
+    -d --restart=no --name $CONTAINER_NAME \\
     --gpus all --network host --ipc host \\
     --cap-add SYS_NICE --cap-add SYS_PTRACE --ulimit memlock=-1 --ulimit stack=67108864 \\
     --memory ${CONTAINER_MEM_GIB}g --memory-swap ${CONTAINER_MEM_GIB}g \\
     --log-opt max-size=50m --log-opt max-file=3 \\
+    -e VLLM_NO_USAGE_STATS=1 \\
+    -e DO_NOT_TRACK=1 \\
+    -e HF_HUB_DISABLE_TELEMETRY=1 \\
+    -e WANDB_DISABLED=true \\
     -e HF_HUB_OFFLINE=1 \\
     -e TRANSFORMERS_OFFLINE=1 \\
     -e VLLM_PLE_CPU_OFFLOAD=1 \\
@@ -1110,6 +1114,7 @@ bash "$LAUNCH_SCRIPT"
 rm -f "$LAUNCH_SCRIPT"
 ok "Container $CONTAINER_NAME started."
 
+if [[ "${MEMWATCH_ENABLED:-0}" == "1" ]]; then
 # Start the watchdog via the shared helper start.sh and supervise.sh both
 # call, so the invocation cannot drift. It kills the previous memwatch, runs
 # memwatch in the background, and echoes the log path.
@@ -1122,6 +1127,9 @@ MEMWATCH_MIN_FREE_GIB="$MEMWATCH_MIN_FREE_GIB" MEMWATCH_FREE_GATE_GIB="$MEMWATCH
     MEMWATCH_GRACE="$MEMWATCH_GRACE" MEMWATCH_LOG="$MEMWATCH_LOG" \
     bash "$SCRIPT_DIR/scripts/start-memwatch.sh" "$CONTAINER_NAME" "$MEMWATCH_MIN_GIB"
 ok "Watchdog running (stops container after 5 samples of MemAvailable < ${MEMWATCH_MIN_GIB} GiB, or MemFree < ${MEMWATCH_MIN_FREE_GIB} GiB while MemAvailable < ${MEMWATCH_FREE_GATE_GIB} GiB): logs/memwatch-${CONTAINER_NAME}.log"
+else
+    info "Plain vLLM: no background watchdog; dgx-model owns lifecycle."
+fi
 info "Loading weights (~3-4 min). Following logs until ready..."
 
 docker logs -f "$CONTAINER_NAME" &
@@ -1135,8 +1143,8 @@ while true; do
     if [[ "$ELAPSED" -gt "$READY_TIMEOUT_S" ]]; then
         kill $LOGPID 2>/dev/null || true
         echo ""
-        err "Readiness timed out after ${ELAPSED}s (>READY_TIMEOUT_S=${READY_TIMEOUT_S})."
-        err "Container was wedged before /health; archiving, removing, and exiting non-zero."
+        warn "Readiness timed out after ${ELAPSED}s (>READY_TIMEOUT_S=${READY_TIMEOUT_S})."
+        warn "Container was wedged before /health; archiving, removing, and exiting non-zero."
         docker logs --tail 100 "$CONTAINER_NAME" 2>&1 || true
         # Archive + remove the wedged container. A timed-out container left
         # Restarting in systemd's eyes would be relaunched by the supervisor

@@ -21,6 +21,8 @@
 #   VERIFY_SHA256=0 ./download.sh       # skip sha256 verification of LFS blobs
 set -euo pipefail
 
+export HF_HUB_DISABLE_TELEMETRY=1 DO_NOT_TRACK=1 VLLM_NO_USAGE_STATS=1 WANDB_DISABLED=true
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
@@ -242,7 +244,7 @@ if [[ "${SKIP_ARIA:-0}" != "1" ]]; then
     # Drop to the invoking user's uid:gid inside the container: the cache
     # must stay owned by the host user, or the unprivileged sha256 verify
     # below (and hf/huggingface-cli on the host) cannot write their state.
-    docker run --rm -i \
+    docker run --rm -i -e HF_HUB_DISABLE_TELEMETRY=1 -e DO_NOT_TRACK=1 -e VLLM_NO_USAGE_STATS=1 -e WANDB_DISABLED=true \
         -e HF_HOME=/hf -e HF_TOKEN="$HF_TOKEN" \
         -u "$(id -u):$(id -g)" \
         -v "$HF_CACHE_DIR:/hf" \
